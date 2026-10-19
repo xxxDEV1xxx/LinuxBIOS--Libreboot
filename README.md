@@ -1,0 +1,2 @@
+# LinuxBIOS--Libreboot
+precarious delecate 
