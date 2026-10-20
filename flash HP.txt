@@ -1,0 +1,114 @@
+MAKE SURE to back up the original firmware image first:
+
+flashprog -p internal -r factory.rom
+
+
+
+1. Install the tools to external storage and symlink them
+bash
+mkdir -p /data/lib-ext/usr/bin
+cp -v $L/src/coreboot/default/util/nvramtool/nvramtool $L/elf/coreboot/default/cbfstool $L/elf/coreboot/default/ifdtool /data/lib-ext/usr/bin/
+for t in nvramtool cbfstool ifdtool; do ln -sfn /data/lib-ext/usr/bin/$t /usr/bin/$t; done
+which nvramtool cbfstool ifdtool
+
+After this, use cbfstool and ifdtool directly. $CBFSTOOL and $IFDTOOL also still work.
+
+2. Hyper-Threading off (on the 2560p only)
+
+Copy /data/lib-ext/usr/bin/nvramtool to the 2560p, then run:
+
+bash
+sudo ./nvramtool -w hyper_threading=Disable && sudo ./nvramtool -r hyper_threading
+
+It takes effect on the next boot.
+
+3. Add the BIOS-region write lock to the lbmk config
+
+Insertion point: end of the file, directly after its last line.
+
+bash
+C=$L/config/module/coreboot/hp2560p_8mb/config/libgfxinit_corebootfb
+cp -v $C $C.orig
+[ -n "$(tail -c1 $C)" ] && echo >> $C
+echo 'CONFIG_BOOTMEDIA_SMM_BWP=y' >> $C
+tail -3 $C
+
+Rebuild (this compiles edk2, GRUB and SeaBIOS, so it takes a while):
+
+bash
+cd $L && ./mk -b coreboot hp2560p_8mb 2>&1 | tail -40
+find $L -newer $C.orig -name '*.rom' 2>/dev/null
+
+The rebuilt ROM won’t contain the ME, GbE or EC blobs, so it needs the ./mk inject step that produced your current ROM. If the build or inject step fails, or inject wants a network fetch, send me the error. I’ll give you cbfstool lines to transplant the new coreboot stages into work.rom instead.
+
+4. Get the default GRUB config so I can write the exact password lines
+bash
+cd /data/sda4/libreboot-ready/bin/hp2560p_8mb
+strings -n 6 payload.elf | sed -n '48510,48700p'
+strings -n 6 payload.elf | sed -n '36672,36690p'
+
+
+
+
+
+
+L=/data/sda4/libre/libreboot-26.10_src
+C=$L/config/module/coreboot/hp2560p_8mb/config/libgfxinit_corebootfb
+cd /data/sda4/libreboot-ready/bin/hp2560p_8mb
+[ -f $C.orig ] || cp -v $C $C.orig
+grep -q '^CONFIG_BOOTMEDIA_SMM_BWP=y$' $C || { [ -n "$(tail -c1 $C)" ] && echo >> $C; echo 'CONFIG_BOOTMEDIA_SMM_BWP=y' >> $C; }
+tail -3 $C
+strings -n 6 payload.elf | sed -n '48510,48700p'
+strings -n 6 payload.elf | sed -n '36672,36690p'
+cd $L && ./mk -b coreboot hp2560p_8mb 2>&1 | tail -40
+
+
+cd /data/sda4/libreboot-ready/bin/hp2560p_8mb
+OFF=$(grep -abo 'boot/grub/grub_default.cfg' payload.elf | head -1 | cut -d: -f1)
+SZ=$((8#$(tail -c +$((OFF+125)) payload.elf | head -c 11)))
+tail -c +$((OFF+513)) payload.elf | head -c $SZ > grub_default.cfg
+echo "SZ=$SZ"; head -3 grub_default.cfg; tail -4 grub_default.cfg
+strings payload.elf | grep -c password_pbkdf2
+python3 - > hash.txt <<'EOF'
+import hashlib,os,getpass,sys
+a=getpass.getpass("GRUB password: "); b=getpass.getpass("Again: ")
+if a!=b: sys.exit("mismatch")
+s=os.urandom(64); h=hashlib.pbkdf2_hmac('sha512',a.encode(),s,10000,64)
+print("grub.pbkdf2.sha512.10000.%s.%s"%(s.hex().upper(),h.hex().upper()))
+EOF
+[ -s hash.txt ] && { printf 'insmod password_pbkdf2\nset superusers="root"\npassword_pbkdf2 root %s\n' "$(cat hash.txt)"; cat grub_default.cfg; } > grub.cfg && head -4 grub.cfg | cut -c1-80
+
+
+
+id builder >/dev/null 2>&1 || useradd -m builder
+chown -R builder:builder /data/sda4/libre/libreboot-26.10_src
+su builder -c "cd /data/sda4/libre/libreboot-26.10_src && ./mk -b coreboot hp2560p_8mb 2>&1 | tail -40"
+
+
+
+
+
+cd /data/sda4/libreboot-ready/bin/hp2560p_8mb
+ls -l grub.cfg grub_default.cfg hash.txt
+wc -c grub_default.cfg
+head -4 grub.cfg | cut -c1-80
+strings payload.elf | grep -c password_pbkdf2
+
+
+df -h / | tail -1
+cd /data/sda4/libre/libreboot-26.10_src && ./mk dependencies debian
+
+
+chown -R builder:builder /data/sda4/libre/libreboot-26.10_src
+su builder -c "cd /data/sda4/libre/libreboot-26.10_src && ./mk -b coreboot hp2560p_8mb 2>&1 | tail -40"
+
+
+
+
+. Gate, inject grub.cfg, then IFD lock (one block, stops on any failure)
+bash
+cd /data/sda4/libreboot-ready/bin/hp2560p_8mb && [ -s grub.cfg ] && [ "$(strings payload.elf | grep -c password_pbkdf2)" -gt 0 ] && head -3 grub.cfg | cut -c1-60 && cbfstool work.rom remove -n grub.cfg 2>/dev/null; cbfstool work.rom add -f grub.cfg -n grub.cfg -t raw && cbfstool work.rom print | grep -n 'grub.cfg' && ifdtool -l work.rom -O final.rom && sha256sum orig.rom final.rom
+If it prints nothing, a gate failed. Either grub.cfg is missing or empty, or password_pbkdf2 isn’t in the payload. Don’t flash in that case. Send me the output of ls -l grub.cfg hash.txt and wc -c grub_default.cfg.
+Why the gate matters: without the password_pbkdf2 module, set superusers leaves nobody able to authenticate and the menu would be unbootable.
+Expected on success: the first three lines are insmod password_pbkdf2, set superusers="root" and the hash line. Then a grub.cfg row appears in the print listing, and the two sha256 values differ.
+2. Flash with your own commands, on the clip, using final.rom
