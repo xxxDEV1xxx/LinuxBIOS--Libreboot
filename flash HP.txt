@@ -112,3 +112,7 @@ If it prints nothing, a gate failed. Either grub.cfg is missing or empty, or pas
 Why the gate matters: without the password_pbkdf2 module, set superusers leaves nobody able to authenticate and the menu would be unbootable.
 Expected on success: the first three lines are insmod password_pbkdf2, set superusers="root" and the hash line. Then a grub.cfg row appears in the print listing, and the two sha256 values differ.
 2. Flash with your own commands, on the clip, using final.rom
+
+/data/flashprog-private/bin/flashprog -p ch341a_spi -c "W25Q64BV/W25Q64CV/W25Q64FV" -w /data/sda4/libreboot-ready/bin/hp2560p_8mb/edk2_grub_seabios_hp2560p_8mb_libgfxinit_corebootfb.rom #inspect
+
+/data/flashprog-private/bin/flashprog -p ch341a_spi -c "W25Q64BV/W25Q64CV/W25Q64FV" -v /data/sda4/libreboot-ready/bin/hp2560p_8mb/edk2_grub_seabios_hp2560p_8mb_libgfxinit_corebootfb.rom
