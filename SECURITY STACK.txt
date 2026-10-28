@@ -24,6 +24,24 @@ DEBIAN 12 BOOKWORM
         PLUTO SDR
             -EMBEDDED FIREWALL BASED ON PACKET HEADERS.
 
+
+                -qemu qnet
+                   =DEBIAN 12 BOOKWORM
+                   -SDA1 BOOT OS ISO9660 READ ONLY
+                      Instructions:
+                       # start the qemu iso
+                       qnet boot
+                       # open qemu console window
+                       qnet console
+                       # leave qemu console after booting
+                       ctrl+B then d
+                       # $$$ turn NIC adapters onto the VM only
+                       qnet on
+                       # go back into qemu console
+                       qnet console
+
+                #### youre now switched to read only iso9660 virtual machine with the adapters isolated to it
+
     CTW-SOCIAL
         -OOB GUARD
         -PACIFIED STRING NOTATION
