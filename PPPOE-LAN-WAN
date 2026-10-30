@@ -1,0 +1,977 @@
+
+
+Step 1: install via the overlay method (steps 1 to 3 of yours, then verify). Your step 4 (apt-get install) can’t write to the read-only root, so it’s replaced by a check. Run on the host:
+#############################################
+cat > /data/p0pppoe-install.sh <<'SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+D=/data/lib-ext/p0pppoe
+A=/data/lib-ext/apt-cache
+O="-o Dir::Cache::archives=$A/archives -o Dir::State::Lists=$A/lists -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Debug::NoLocking=1 -o APT::Sandbox::User=root"
+mkdir -p $A/archives/partial $A/lists/partial $D/etc-ppp
+echo "=== 1. DOWNLOAD"
+apt-get $O install --download-only --reinstall -y ppp pppoe 2>&1 | tail -4
+ls $A/archives/ppp_*.deb $A/archives/pppoe_*.deb
+echo "=== 2. EXTRACT"
+rm -rf $D/pkg; mkdir -p $D/pkg
+for d in $A/archives/ppp_*.deb $A/archives/pppoe_*.deb; do dpkg-deb -x "$d" $D/pkg; done
+echo "=== 3. SYMLINKS"
+for b in pppd pppoe-server pppoe; do
+  [ -e /usr/sbin/$b ] || ln -sfn $D/pkg/usr/sbin/$b /usr/sbin/$b
+done
+[ -e /usr/lib/pppd ] || ln -sfn $D/pkg/usr/lib/pppd /usr/lib/pppd
+[ -e /etc/ppp ] || ln -sfn $D/etc-ppp /etc/ppp
+PLUG=$(find $D/pkg -name rp-pppoe.so | head -1)
+test -f "$PLUG" || { echo "ABORT: rp-pppoe.so not found"; exit 1; }
+echo "=== 4. CONFIG + VERIFY"
+S=$D/etc-ppp
+if [ ! -f $S/chap-secrets ]; then
+  PW=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+  ( umask 077; printf 'p0client * %s 10.99.0.2\n' "$PW" > $S/chap-secrets )
+fi
+: > $S/pap-secrets; chmod 600 $S/chap-secrets $S/pap-secrets
+cat > $D/server-options <<EOF
+name p0server
+require-chap
+refuse-pap
+refuse-eap
+refuse-mschap
+refuse-mschap-v2
+nodefaultroute
+noipdefault
+nobsdcomp
+nodeflate
+mtu 1492
+mru 1492
+lcp-echo-interval 10
+lcp-echo-failure 3
+EOF
+cat > $D/client-options <<EOF
+plugin $PLUG
+nic-pn
+user p0client
+remotename p0server
+noauth
+refuse-pap
+refuse-eap
+nodefaultroute
+noipdefault
+nobsdcomp
+nodeflate
+mtu 1492
+mru 1492
+lcp-echo-interval 10
+lcp-echo-failure 3
+ifname p0c
+linkname p0ppp
+maxfail 1
+updetach
+EOF
+export LD_LIBRARY_PATH=$D/pkg/usr/lib/x86_64-linux-gnu:$D/pkg/lib/x86_64-linux-gnu
+for b in $D/pkg/usr/sbin/pppd $D/pkg/usr/sbin/pppoe-server; do
+  echo "ldd $b:"; ldd $b | grep 'not found' || echo "  libs OK"
+done
+$D/pkg/usr/sbin/pppd --version 2>&1 | head -1
+for m in ppp_generic pppoe pppox; do modprobe -n $m && echo "module $m OK"; done
+ls -l /etc/ppp /usr/sbin/pppd /usr/sbin/pppoe-server | head -8
+echo INSTALL_DONE
+SCRIPT
+bash -n /data/p0pppoe-install.sh && bash /data/p0pppoe-install.sh 2>&1 | tee /data/p0pppoe-install.log
+####################
+#It must end with INSTALL_DONE, with libs OK for both binaries and module ... OK for all three modules. Stop and paste the output if any ldd line lists not found, if modprobe -n fails (the kernel lacks PPPoE), or if the ln steps fail on the read-only root.
+
+#Step 2: the toggle. This is a new file and doesn’t touch existing configs:
+
+################
+cat > /data/lib-ext/p0pppoe/ctl <<'CTL'
+#!/bin/bash
+D=/data/lib-ext/p0pppoe; R=/run/p0pppoe
+WAN=wg0; LAN=nx0; NS=p0ppp
+export LD_LIBRARY_PATH=$D/pkg/usr/lib/x86_64-linux-gnu:$D/pkg/lib/x86_64-linux-gnu
+PPPD=$D/pkg/usr/sbin/pppd; SRV=$D/pkg/usr/sbin/pppoe-server
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+exec 9>/run/p0pppoe.lock; flock 9
+
+off_cmd() {
+  set +e
+  ip rule del iif $LAN lookup 100 priority 100 2>/dev/null
+  ip rule del iif $LAN lookup main suppress_prefixlength 0 priority 99 2>/dev/null
+  ip route flush table 100 2>/dev/null
+  nft delete table inet p0pppoe 2>/dev/null
+  nft delete table ip p0pppoe_nat 2>/dev/null
+  [ -f /var/run/ppp-p0ppp.pid ] && kill "$(head -1 /var/run/ppp-p0ppp.pid)" 2>/dev/null
+  pkill -f "pppd file $D/client-options" 2>/dev/null
+  [ -f $R/server.pid ] && kill "$(cat $R/server.pid)" 2>/dev/null
+  pkill -f "$D/server-options" 2>/dev/null
+  sleep 1
+  ip netns del $NS 2>/dev/null
+  ip link del lh 2>/dev/null; ip link del ph 2>/dev/null
+  [ -f $R/bind ] && umount /etc/ppp 2>/dev/null
+  [ -f $R/sysctl ] && while read -r l; do sysctl -qw "$l"; done < $R/sysctl
+  if [ -f $R/pre-route ]; then
+    ip -4 route show table main | diff -q - $R/pre-route >/dev/null && echo "ROUTES: main table identical to pre-ON" || echo "ROUTES: main table differs from pre-ON (check ip route)"
+    ip rule show | diff -q - $R/pre-rule >/dev/null && echo "RULES: identical to pre-ON" || echo "RULES: differ from pre-ON (check ip rule)"
+  fi
+  rm -rf $R
+  echo "pppoe: OFF"
+}
+
+on_cmd() {
+  [ -d $R ] && { echo "pppoe: already on (or run: pppoe off)"; return 0; }
+  ip link show $WAN >/dev/null 2>&1 && ip link show $LAN >/dev/null 2>&1 || { echo "ABORT: $WAN/$LAN not on host (NICs handed to VM?)"; return 1; }
+  [ -z "$(ip route show table 100 2>/dev/null)" ] || { echo "ABORT: routing table 100 in use"; return 1; }
+  [ -x $PPPD ] && [ -x $SRV ] || { echo "ABORT: run /data/p0pppoe-install.sh first"; return 1; }
+  mkdir -p $R
+  set -Ee
+  trap 'trap - ERR; echo "pppoe: FAILED at line $LINENO; rolling back"; off_cmd; return 1' ERR
+  ip -4 route show table main > $R/pre-route; ip rule show > $R/pre-rule; nft list ruleset > $R/pre-nft
+  for m in ppp_generic pppoe pppox; do modprobe $m; done
+  for k in net.ipv4.ip_forward net.ipv4.conf.all.rp_filter net.ipv4.conf.$LAN.rp_filter; do echo "$k=$(sysctl -n $k)" >> $R/sysctl; done
+  sysctl -qw net.ipv4.ip_forward=1
+  for k in net.ipv4.conf.all.rp_filter net.ipv4.conf.$LAN.rp_filter; do [ "$(sysctl -n $k)" = 1 ] && sysctl -qw $k=2; done
+  # namespace + links
+  ip netns add $NS
+  ip link add lh type veth peer name ln
+  ip link add ph type veth peer name pn
+  ip link set ln netns $NS; ip link set pn netns $NS
+  ip addr add 10.98.0.1/30 dev lh; ip link set lh up; ip link set ph up
+  sysctl -qw net.ipv4.conf.lh.rp_filter=2
+  ip -n $NS addr add 10.98.0.2/30 dev ln
+  ip -n $NS link set lo up; ip -n $NS link set ln up; ip -n $NS link set pn up
+  # ppp config dir
+  if [ "$(readlink -f /etc/ppp)" != "$D/etc-ppp" ]; then mount --bind $D/etc-ppp /etc/ppp; echo 1 > $R/bind; fi
+  # PPPoE server (host end) and client (namespace end)
+  $SRV -I ph -L 10.99.0.1 -R 10.99.0.2 -N 1 -C p0pppoe -S p0pppoe -k -X $R/server.pid -O $D/server-options
+  sleep 1
+  timeout 40 ip netns exec $NS $PPPD file $D/client-options
+  ip -n $NS addr show dev p0c | grep -q 10.99.0.2
+  ip -n $NS route add default dev p0c
+  ip netns exec $NS sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0
+  ip netns exec $NS nft -f - <<NSNFT
+table ip p0ns {
+  chain post { type nat hook postrouting priority 100; oifname "p0c" masquerade }
+  chain fwd { type filter hook forward priority 0; policy drop;
+    iifname "p0c" tcp flags syn tcp option maxseg size > 1452 tcp option maxseg size set 1452
+    oifname "p0c" tcp flags syn tcp option maxseg size > 1452 tcp option maxseg size set 1452
+    iifname "ln" oifname "p0c" accept
+    iifname "p0c" oifname "ln" ct state established,related accept
+  }
+}
+NSNFT
+  nft -f - <<HNFT
+table inet p0pppoe {
+  chain fwd { type filter hook forward priority -5; policy accept;
+    iifname "ppp*" oifname != "$WAN" drop
+    iifname "ppp*" ip saddr != 10.99.0.2 drop
+    iifname "$WAN" oifname "ppp*" ct state new drop
+    iifname "lh" ct state new drop
+  }
+}
+table ip p0pppoe_nat {
+  chain post { type nat hook postrouting priority 90; ip saddr 10.99.0.0/24 oifname "$WAN" masquerade }
+}
+HNFT
+  # link test BEFORE cutover; failure rolls back without touching LAN routing
+  ip netns exec $NS ping -c2 -W3 -I p0c 1.1.1.1 >/dev/null || { echo "PPP link test failed (no path via $WAN)"; false; }
+  ip route add default via 10.98.0.2 dev lh table 100
+  ip rule add iif $LAN lookup main suppress_prefixlength 0 priority 99
+  ip rule add iif $LAN lookup 100 priority 100
+  trap - ERR; set +E
+  echo "pppoe: ON ($LAN clients -> lh -> $NS -> PPPoE -> $WAN)"
+}
+
+status_cmd() {
+  [ -d $R ] && echo "pppoe: ON" || echo "pppoe: OFF"
+  ip rule show | grep -E 'priority|lookup (100|main suppress)' | grep -E '^(99|100):' || true
+  ip -br addr show 2>/dev/null | grep -E '^(lh|ph|ppp)' || true
+  ip -n $NS -br addr 2>/dev/null | grep -E 'p0c|ln' || true
+}
+
+case "${1:-}" in
+  on) on_cmd ;; off) off_cmd ;; status) status_cmd ;;
+  *) echo "usage: pppoe on|off|status" ;;
+esac
+CTL
+chmod 755 /data/lib-ext/p0pppoe/ctl
+printf '%s\n' 'pppoe() { /data/lib-ext/p0pppoe/ctl "$@"; }' > /data/lib-ext/p0pppoe/pppoe-func.sh
+bash -n /data/lib-ext/p0pppoe/ctl && echo SYNTAX_OK
+grep -q pppoe-func /root/.bashrc || echo '. /data/lib-ext/p0pppoe/pppoe-func.sh' >> /root/.bashrc
+. /data/lib-ext/p0pppoe/pppoe-func.sh
+
+##############################
+#Apply the targeted fixes
+#Run this on flex. It backs up the controller, removes the unsupported -k option, and fixes the nftables chain formatting. It does not activate PPPoE, modify persistent firewall rules, or alter routes.
+##################################
+set -euo pipefail
+
+CTL=/data/lib-ext/p0pppoe/ctl
+BACKUP="$CTL.before-syntax-fix-$(date +%Y%m%d-%H%M%S)"
+
+cp -a "$CTL" "$BACKUP"
+
+python3 - "$CTL" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+old_server = '-C p0pppoe -S p0pppoe -k -X'
+new_server = '-C p0pppoe -S p0pppoe -X'
+
+if old_server not in s:
+    raise SystemExit("ABORT: expected pppoe-server command not found")
+
+s = s.replace(old_server, new_server, 1)
+
+old_nat = 'chain post { type nat hook postrouting priority 100; oifname "p0c" masquerade }'
+new_nat = '''chain post {
+    type nat hook postrouting priority 100; policy accept;
+    oifname "p0c" masquerade
+  }'''
+
+if old_nat not in s:
+    raise SystemExit("ABORT: expected namespace NAT chain not found")
+
+s = s.replace(old_nat, new_nat, 1)
+
+old_host_nat = 'chain post { type nat hook postrouting priority 90; ip saddr 10.99.0.0/24 oifname "$WAN" masquerade }'
+new_host_nat = '''chain post {
+    type nat hook postrouting priority 90; policy accept;
+    ip saddr 10.99.0.0/24 oifname "$WAN" masquerade
+  }'''
+
+if old_host_nat not in s:
+    raise SystemExit("ABORT: expected host NAT chain not found")
+
+s = s.replace(old_host_nat, new_host_nat, 1)
+
+p.write_text(s)
+PY
+
+echo '=== BASH SYNTAX ==='
+bash -n "$CTL"
+
+echo '=== PPPoE SERVER OPTIONS ==='
+grep -n '\$SRV -I' "$CTL"
+
+echo '=== UPDATED NFTABLES CHAINS ==='
+grep -n -A5 'chain post {' "$CTL"
+
+echo "Backup: $BACKUP"
+echo 'PATCH_APPLIED'
+
+###################################
+CTL=/data/lib-ext/p0pppoe/ctl
+
+bash -n "$CTL" && echo BASH_SYNTAX_OK
+
+sed -n '/ip netns exec \$NS nft -f - <<NSNFT/,/^NSNFT$/p' "$CTL" |
+  sed '1d;$d' |
+  nft -c -f -
+
+sed -n '/nft -f - <<HNFT/,/^HNFT$/p' "$CTL" |
+  sed '1d;$d' |
+  WAN=wg0
+
+###############################
+set -e
+
+CTL=/data/lib-ext/p0pppoe/ctl
+cp -a "$CTL" "$CTL.bak-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$CTL" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+old = "chain fwd {"
+new = "chain ppp_forward {"
+
+count = s.count(old)
+if count != 2:
+    raise SystemExit(
+        f"ABORT: expected 2 chain definitions, found {count}"
+    )
+
+p.write_text(s.replace(old, new))
+print(f"Fixed {count} nftables chain names")
+PY
+
+bash -n "$CTL" && echo BASH_SYNTAX_OK
+
+echo '=== CHECK NAMESPACE NFTABLES SYNTAX ==='
+sed -n '/ip netns exec \$NS nft -f - <<NSNFT/,/^NSNFT$/p' "$CTL" |
+  sed '1d;$d' |
+  nft -c -f - && echo NAMESPACE_NFT_SYNTAX_OK
+
+echo '=== CHECK HOST NFTABLES SYNTAX ==='
+sed -n '/nft -f - <<HNFT/,/^HNFT$/p' "$CTL" |
+  sed '1d;$d' |
+  sed 's/\$WAN/wg0/g' |
+  nft -c -f - && echo HOST_NFT_SYNTAX_OK
+######################
+
+
+CTL=/data/lib-ext/p0pppoe/ctl
+
+# 1. Confirm both configurations parse
+bash -n "$CTL" || exit 1
+
+sed -n '/ip netns exec \$NS nft -f - <<NSNFT/,/^NSNFT$/p' "$CTL" |
+  sed '1d;$d' |
+  nft -c -f - || exit 1
+
+sed -n '/nft -f - <<HNFT/,/^HNFT$/p' "$CTL" |
+  sed '1d;$d' |
+  sed 's/\$WAN/wg0/g' |
+  nft -c -f - || exit 1
+
+echo BOTH_NFT_CHECKS_PASS
+
+
+###########################
+
+. /data/lib-ext/p0pppoe/pppoe-func.sh
+
+pppoe on
+pppoe status
+ip netns exec p0ppp ping -c2 -W3 -I p0c 1.1.1.1
+##########################
+echo '=== WAN ROUTE ==='
+ip -4 route get 1.1.1.1
+ip -4 route show default
+ip -4 addr show dev wg0
+
+echo '=== FORWARDING ==='
+sysctl net.ipv4.ip_forward
+sysctl net.ipv4.conf.all.rp_filter
+sysctl net.ipv4.conf.wg0.rp_filter
+
+echo '=== EXISTING FORWARD CHAINS ==='
+nft -a list ruleset | grep -n -E \
+  'hook forward|policy drop|iifname "wg0"|oifname "wg0"|iifname "ppp|oifname "ppp|queue num|masquerade'
+
+echo '=== PPPoE STATUS AFTER ROLLBACK ==='
+/data/lib-ext/p0pppoe/ctl status
+
+echo '=== SERVER OPTIONS ==='
+cat /data/lib-ext/p0pppoe/server-options
+
+##############################
+
+
+nft -a -nn list ruleset | awk '
+/^table / {
+    table_name=$2 " " $3
+}
+/^[[:space:]]*chain / {
+    chain_name=$2
+}
+/hook forward/ {
+    print "TABLE:", table_name
+    print "CHAIN:", chain_name
+    print "DEFINITION:", $0
+    print ""
+}'
+
+
+
+
+
+
+
+
+
+########################
+
+set -euo pipefail
+
+CTL=/data/lib-ext/p0pppoe/ctl
+cp -a "$CTL" "$CTL.before-forward-fix-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$CTL" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+helpers = r'''
+# Temporary, narrowly scoped exceptions for the PPPoE forwarding path.
+add_forward_rule() {
+    tag=$1
+    shift
+    if ! iptables -C FORWARD "$@" >/dev/null 2>&1; then
+        iptables -I FORWARD 1 "$@"
+        : > "$R/fw-$tag"
+    fi
+}
+
+remove_forward_rules() {
+    if [ -f "$R/fw-ppp-out" ]; then
+        iptables -D FORWARD -i ppp+ -o "$WAN" -s 10.99.0.2/32 -j ACCEPT 2>/dev/null || true
+        rm -f "$R/fw-ppp-out"
+    fi
+    if [ -f "$R/fw-ppp-return" ]; then
+        iptables -D FORWARD -i "$WAN" -o ppp+ -d 10.99.0.2/32 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        rm -f "$R/fw-ppp-return"
+    fi
+    if [ -f "$R/fw-lan-out" ]; then
+        iptables -D FORWARD -i "$LAN" -o lh -s 192.168.254.0/24 -j ACCEPT 2>/dev/null || true
+        rm -f "$R/fw-lan-out"
+    fi
+    if [ -f "$R/fw-lan-return" ]; then
+        iptables -D FORWARD -i lh -o "$LAN" -d 192.168.254.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        rm -f "$R/fw-lan-return"
+    fi
+}
+
+install_forward_rules() {
+    command -v iptables >/dev/null || {
+        echo "ABORT: iptables unavailable"
+        return 1
+    }
+
+    # LAN clients enter the namespace through the host veth.
+    add_forward_rule lan-out \
+        -i "$LAN" -o lh -s 192.168.254.0/24 -j ACCEPT
+
+    add_forward_rule lan-return \
+        -i lh -o "$LAN" -d 192.168.254.0/24 \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # PPPoE client traffic exits the host through the WAN.
+    add_forward_rule ppp-out \
+        -i ppp+ -o "$WAN" -s 10.99.0.2/32 -j ACCEPT
+
+    add_forward_rule ppp-return \
+        -i "$WAN" -o ppp+ -d 10.99.0.2/32 \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+}
+'''
+
+if "install_forward_rules()" not in s:
+    marker = "off_cmd() {"
+    if marker not in s:
+        raise SystemExit("ABORT: off_cmd function not found")
+    s = s.replace(marker, helpers + "\n" + marker, 1)
+
+old = "off_cmd() {\n  set +e"
+new = "off_cmd() {\n  set +e\n  remove_forward_rules"
+if "  remove_forward_rules\n" not in s:
+    if old not in s:
+        raise SystemExit("ABORT: off_cmd cleanup insertion point not found")
+    s = s.replace(old, new, 1)
+
+marker = "  # link test BEFORE cutover; failure rolls back without touching LAN routing"
+if "  install_forward_rules\n" not in s:
+    if marker not in s:
+        raise SystemExit("ABORT: pre-cutover link-test marker not found")
+    s = s.replace(marker, "  install_forward_rules\n" + marker, 1)
+
+p.write_text(s)
+print("PPPoE forwarding integration patched.")
+PY
+
+bash -n "$CTL" && echo CONTROLLER_SYNTAX_OK
+
+
+#############################
+
+
+. /data/lib-ext/p0pppoe/pppoe-func.sh
+
+pppoe on
+
+
+#####################
+
+
+pppoe status
+
+ip netns exec p0ppp ping -c2 -W3 -I p0c 1.1.1.1
+
+#####################
+
+bash <<'RECOVER'
+set +e
+
+R=/run/p0pppoe
+WAN=wg0
+LAN=nx0
+
+echo '=== 1. RESTORE ORIGINAL POLICY ROUTING ==='
+
+ip rule del iif "$LAN" lookup 100 priority 100 2>/dev/null
+ip rule del iif "$LAN" lookup main suppress_prefixlength 0 priority 99 2>/dev/null
+ip route flush table 100 2>/dev/null
+
+echo '=== 2. REMOVE PPPoE FIREWALL EXCEPTIONS ==='
+
+if [ -f "$R/fw-lan-out" ]; then
+    iptables -D FORWARD -i "$LAN" -o lh -s 192.168.254.0/24 -j ACCEPT 2>/dev/null
+fi
+
+if [ -f "$R/fw-lan-return" ]; then
+    iptables -D FORWARD -i lh -o "$LAN" -d 192.168.254.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+fi
+
+if [ -f "$R/fw-ppp-out" ]; then
+    iptables -D FORWARD -i ppp+ -o "$WAN" -s 10.99.0.2/32 -j ACCEPT 2>/dev/null
+fi
+
+if [ -f "$R/fw-ppp-return" ]; then
+    iptables -D FORWARD -i "$WAN" -o ppp+ -d 10.99.0.2/32 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+fi
+
+nft delete table inet p0pppoe 2>/dev/null
+nft delete table ip p0pppoe_nat 2>/dev/null
+
+echo '=== 3. STOP PPP PROCESSES ==='
+
+for f in /var/run/ppp-p0ppp.pid "$R/server.pid"; do
+    if [ -f "$f" ]; then
+        read -r pid < "$f"
+        case "$pid" in
+            ''|*[!0-9]*) ;;
+            *) echo "Stopping PID $pid from $f"; kill -TERM "$pid" 2>/dev/null ;;
+        esac
+    fi
+done
+
+for pid in $(ip netns pids p0ppp 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null
+done
+
+sleep 2
+
+for pid in $(ip netns pids p0ppp 2>/dev/null); do
+    kill -KILL "$pid" 2>/dev/null
+done
+
+echo '=== 4. REMOVE PPPoE NAMESPACE AND VETH LINKS ==='
+
+ip netns del p0ppp 2>/dev/null
+ip link del lh 2>/dev/null
+ip link del ph 2>/dev/null
+
+echo '=== 5. RESTORE ORIGINAL SYSCTL SETTINGS ==='
+
+if [ -f "$R/sysctl" ]; then
+    while IFS= read -r setting; do
+        [ -n "$setting" ] && sysctl -qw "$setting"
+    done < "$R/sysctl"
+fi
+
+if [ -f "$R/bind" ]; then
+    umount /etc/ppp 2>/dev/null
+fi
+
+echo '=== 6. REMOVE STALE PPPoE STATE ==='
+
+rm -rf "$R"
+rm -f /run/p0pppoe.lock
+
+echo '=== 7. VERIFY RECOVERY ==='
+
+echo '-- Policy rules --'
+ip rule show
+
+echo '-- Main default route --'
+ip -4 route show default
+
+echo '-- WAN connectivity --'
+ip -4 route get 1.1.1.1
+
+echo '-- PPP namespace --'
+ip netns list
+
+echo '-- Controller state --'
+/data/lib-ext/p0pppoe/ctl status
+
+echo 'RECOVERY_SEQUENCE_COMPLETE'
+RECOVER
+
+########################
+
+
+CTL=/data/lib-ext/p0pppoe/ctl
+
+cp -a "$CTL" "$CTL.pre-lock-fix-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$CTL" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+lines = p.read_text().splitlines()
+
+server_count = 0
+client_count = 0
+
+for i, line in enumerate(lines):
+    if line.lstrip().startswith('$SRV -I ph '):
+        if '9>&-' not in line:
+            lines[i] = line.rstrip() + ' 9>&-'
+        server_count += 1
+
+    if 'timeout 40 ip netns exec $NS $PPPD file $D/client-options' in line:
+        if '9>&-' not in line:
+            lines[i] = line.rstrip() + ' 9>&-'
+        client_count += 1
+
+if server_count != 1 or client_count != 1:
+    raise SystemExit(
+        f"ABORT: expected one server and one client command; "
+        f"found server={server_count}, client={client_count}"
+    )
+
+p.write_text('\n'.join(lines) + '\n')
+print("Closed lock descriptor inheritance for both daemon launches.")
+PY
+
+bash -n "$CTL" && echo CONTROLLER_SYNTAX_OK
+
+grep -nE 'SRV -I ph|timeout 40 ip netns exec' "$CTL"
+
+#############################
+
+. /data/lib-ext/p0pppoe/pppoe-func.sh
+
+timeout 5 pppoe status
+echo "STATUS_EXIT=$?"
+
+flock -n /run/p0pppoe.lock -c 'echo CONTROLLER_LOCK_RELEASED'
+
+####################
+
+pppoe on
+timeout 10 pppoe status
+
+ip netns exec p0ppp ping -c2 -W3 -I p0c 1.1.1.1
+
+ip route show table 100
+ip rule show
+
+########################
+
+set -euo pipefail
+
+CTL=/data/lib-ext/p0pppoe/ctl
+
+cp -a "$CTL" "$CTL.before-ping-fix-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$CTL" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+old = 'ping -c2 -W3 -I p0c 1.1.1.1'
+new = 'ping -c2 -W3 1.1.1.1'
+
+if s.count(old) != 1:
+    raise SystemExit("ABORT: expected exactly one PPP connectivity test")
+
+p.write_text(s.replace(old, new))
+print("Removed redundant ping interface binding.")
+PY
+
+bash -n "$CTL" && echo CONTROLLER_SYNTAX_OK
+grep -n 'ping -c2' "$CTL"
+
+
+#############################
+
+
+. /data/lib-ext/p0pppoe/pppoe-func.sh
+
+pppoe on
+
+##################################
+
+pppoe status
+
+ip netns exec p0ppp ip route get 1.1.1.1
+
+ip netns exec p0ppp ping -c2 -W3 1.1.1.1
+#########################################
+
+
+set -Eeuo pipefail
+
+CTL=/data/lib-ext/p0pppoe/ctl
+cp -a "$CTL" "$CTL.lifecycle-backup-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$CTL" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+helpers = r'''
+# All PPPoE firewall exceptions belong to this controller's ON/OFF lifecycle.
+# Append after existing CTW security-chain checks; never bypass them.
+
+add_forward_rule() {
+    local tag=$1
+    shift
+
+    if ! iptables -C FORWARD "$@" >/dev/null 2>&1; then
+        iptables -A FORWARD "$@"
+    fi
+
+    : > "$R/fw-$tag"
+}
+
+remove_forward_rules() {
+    if [ -f "$R/fw-lan-out" ]; then
+        while iptables -C FORWARD -i "$LAN" -o lh \
+            -s 192.168.254.0/24 -j ACCEPT 2>/dev/null; do
+            iptables -D FORWARD -i "$LAN" -o lh \
+                -s 192.168.254.0/24 -j ACCEPT
+        done
+        rm -f "$R/fw-lan-out"
+    fi
+
+    if [ -f "$R/fw-lan-return" ]; then
+        while iptables -C FORWARD -i lh -o "$LAN" \
+            -d 192.168.254.0/24 \
+            -m conntrack --ctstate ESTABLISHED,RELATED \
+            -j ACCEPT 2>/dev/null; do
+            iptables -D FORWARD -i lh -o "$LAN" \
+                -d 192.168.254.0/24 \
+                -m conntrack --ctstate ESTABLISHED,RELATED \
+                -j ACCEPT
+        done
+        rm -f "$R/fw-lan-return"
+    fi
+
+    if [ -f "$R/fw-ppp-out" ]; then
+        while iptables -C FORWARD -i ppp+ -o "$WAN" \
+            -s 10.99.0.2/32 -j ACCEPT 2>/dev/null; do
+            iptables -D FORWARD -i ppp+ -o "$WAN" \
+                -s 10.99.0.2/32 -j ACCEPT
+        done
+        rm -f "$R/fw-ppp-out"
+    fi
+
+    if [ -f "$R/fw-ppp-return" ]; then
+        while iptables -C FORWARD -i "$WAN" -o ppp+ \
+            -d 10.99.0.2/32 \
+            -m conntrack --ctstate ESTABLISHED,RELATED \
+            -j ACCEPT 2>/dev/null; do
+            iptables -D FORWARD -i "$WAN" -o ppp+ \
+                -d 10.99.0.2/32 \
+                -m conntrack --ctstate ESTABLISHED,RELATED \
+                -j ACCEPT
+        done
+        rm -f "$R/fw-ppp-return"
+    fi
+}
+
+install_forward_rules() {
+    command -v iptables >/dev/null || {
+        echo "ABORT: iptables unavailable"
+        return 1
+    }
+
+    add_forward_rule lan-out \
+        -i "$LAN" -o lh \
+        -s 192.168.254.0/24 -j ACCEPT
+
+    add_forward_rule lan-return \
+        -i lh -o "$LAN" \
+        -d 192.168.254.0/24 \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    add_forward_rule ppp-out \
+        -i ppp+ -o "$WAN" \
+        -s 10.99.0.2/32 -j ACCEPT
+
+    add_forward_rule ppp-return \
+        -i "$WAN" -o ppp+ \
+        -d 10.99.0.2/32 \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+}
+'''
+
+# Replace the complete prior helper block, or insert it before off_cmd.
+start = s.find("add_forward_rule() {")
+off = s.find("off_cmd() {")
+
+if off < 0:
+    raise SystemExit("ABORT: off_cmd not found")
+
+if start >= 0 and start < off:
+    s = s[:start] + helpers + "\n" + s[off:]
+else:
+    s = s[:off] + helpers + "\n" + s[off:]
+
+# OFF must remove rules before deleting runtime state.
+off = s.find("off_cmd() {")
+end = s.find("\non_cmd() {", off)
+if off < 0 or end < 0:
+    raise SystemExit("ABORT: cannot identify ON/OFF functions")
+
+off_body = s[off:end]
+calls = len(re.findall(r"(?m)^\s*remove_forward_rules\s*$", off_body))
+
+if calls == 0:
+    if "set +e" not in off_body:
+        raise SystemExit("ABORT: off_cmd set +e not found")
+    off_body = off_body.replace(
+        "set +e",
+        "set +e\n  remove_forward_rules",
+        1
+    )
+elif calls != 1:
+    raise SystemExit(f"ABORT: unexpected remove_forward_rules calls: {calls}")
+
+s = s[:off] + off_body + s[end:]
+
+# ON must install rules before its pre-cutover connectivity test.
+marker = "# link test BEFORE cutover"
+if marker not in s:
+    raise SystemExit("ABORT: pre-cutover test marker missing")
+
+if len(re.findall(r"(?m)^\s*install_forward_rules\s*$", s)) == 0:
+    s = s.replace(marker, "  install_forward_rules\n" + marker, 1)
+elif len(re.findall(r"(?m)^\s*install_forward_rules\s*$", s)) != 1:
+    raise SystemExit("ABORT: unexpected install_forward_rules call count")
+
+# Give the namespace an explicit return route to the LAN.
+old_route = "  ip -n $NS route add default dev p0c"
+new_route = (
+    old_route + "\n"
+    "  ip -n $NS route replace 192.168.254.0/24 "
+    "via 10.98.0.1 dev ln"
+)
+
+if old_route in s:
+    s = s.replace(old_route, new_route, 1)
+elif "ip -n $NS route replace 192.168.254.0/24 via 10.98.0.1 dev ln" not in s:
+    raise SystemExit("ABORT: namespace default route insertion point missing")
+
+p.write_text(s)
+print("PPPoE ON/OFF lifecycle updated.")
+PY
+
+bash -n "$CTL"
+
+echo '=== VERIFY CONTROLLER LIFECYCLE ==='
+grep -nE \
+'add_forward_rule|install_forward_rules|remove_forward_rules|192.168.254.0/24 via 10.98.0.1|iptables -A FORWARD' \
+"$CTL"
+
+echo CONTROLLER_SYNTAX_OK
+
+####################
+
+
+. /data/lib-ext/p0pppoe/pppoe-func.sh
+
+pppoe off
+pppoe status
+
+pppoe on
+pppoe status
+
+###########################
+
+
+
+cat > /data/lilo-rebuild-img.sh <<'SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+SRC=/data/sda4/LILO-QEMU
+NEW=/data/sda4/LILO-QEMU.new.img
+CUR=/data/sda4/LILO-QEMU.img
+M=/run/lilo
+KVER=6.1.0-50-amd64
+LILOBIN=/data/lib-ext/lilo-pkg/sbin/lilo
+export LD_LIBRARY_PATH=/data/lib-ext/usr/lib/x86_64-linux-gnu:/data/lib-ext/lib/x86_64-linux-gnu
+
+echo "=== 0. PREFLIGHT"
+pgrep -f qemu-system-x86_64 >/dev/null && { echo "ABORT: QEMU running (tmux kill-session -t qnet-iso)"; exit 1; }
+test -x "$LILOBIN" || { echo "ABORT: lilo missing"; exit 1; }
+test -f "$SRC/boot/vmlinuz-$KVER" || { echo "ABORT: kernel missing in $SRC"; exit 1; }
+test ! -L "$SRC/data/lib-ext" || { echo "ABORT: staged lib-ext is a symlink"; exit 1; }
+test -f "$SRC/data/lib-ext/p0pppoe/ctl" || { echo "ABORT: pppoe not staged"; exit 1; }
+test ! -e "$NEW" || { echo "ABORT: $NEW exists; move it aside first"; exit 1; }
+touch /data/sda4/.wtest && rm -f /data/sda4/.wtest || { echo "ABORT: /data/sda4 not writable"; exit 1; }
+MB=$(( $(du -sm "$SRC" | cut -f1) + 2048 ))
+df -h /data/sda4 | tail -1; echo "image size: ${MB}M"
+modprobe loop 2>/dev/null || true
+umount -R "$M" 2>/dev/null || true
+mkdir -p "$M"
+
+echo "=== 1. CREATE IMAGE"
+qemu-img create -f raw "$NEW" ${MB}M
+parted -s "$NEW" mklabel msdos mkpart primary ext4 1MiB 100% set 1 boot on
+L=$(losetup -Pf --show "$NEW")
+trap 'umount -R "$M" 2>/dev/null || true; losetup -d "$L" 2>/dev/null || true' EXIT
+for i in 1 2 3 4 5; do test -b "${L}p1" && break; sleep 1; done
+test -b "${L}p1" || { echo "ABORT: ${L}p1 missing"; exit 1; }
+mkfs.ext4 -F -L LILOROOT "${L}p1"
+mount "${L}p1" "$M"
+
+echo "=== 2. COPY TREE"
+rsync -aHAX --exclude=/boot/grub --exclude=/boot.catalog --exclude=/isolinux "$SRC"/ "$M"/
+
+echo "=== 3. FSTAB"
+touch "$M/etc/fstab"
+sed -i -E '\#^[^#]*[[:space:]]/[[:space:]]#d' "$M/etc/fstab"
+echo '/dev/sda1  /  ext4  defaults,errors=remount-ro  0  1' >> "$M/etc/fstab"
+
+echo "=== 4. LILO"
+CYL=$(( $(blockdev --getsz "$L") / 1008 ))
+cat > "$M/etc/lilo.conf" <<EOF
+lba32
+boot=$L
+disk=$L bios=0x80 sectors=63 heads=16 cylinders=$CYL max-partitions=7
+  partition=${L}p1
+    start=2048
+map=/boot/map
+install=menu
+prompt
+timeout=50
+default=dsls
+image=/boot/vmlinuz-$KVER
+  label=dsls
+  initrd=/boot/initrd.img-$KVER
+  read-only
+  append="root=/dev/sda1 rootfstype=ext4 console=tty0 console=ttyS0,115200n8 systemd.mask=p0-reverseshell-v3.service"
+EOF
+mkdir -p "$M/dev" "$M/proc" "$M/sys"
+mount --bind /dev "$M/dev"; mount --bind /proc "$M/proc"
+"$LILOBIN" -r "$M" -C /etc/lilo.conf -P ignore -v
+sync
+
+echo "=== 5. VERIFY"
+[ "$(dd if="$L" bs=512 count=1 2>/dev/null | grep -a -c LILO)" -ge 1 ] && echo MBR_LILO=PASS || { echo MBR_LILO=FAIL; exit 1; }
+stat -c '%F  %n' "$M/data/lib-ext" "$M/data/lib-ext/p0pppoe/ctl" "$M/data/lib-ext/p0pppoe/pkg/usr/sbin/pppd"
+for b in pppd pppoe-server pppoe; do printf '%s -> %s\n' "$b" "$(readlink $M/usr/sbin/$b)"; done
+ls -ld "$M/etc/ppp"
+grep -c pppoe-func "$M/root/.bashrc" "$M/etc/p0guard-shell.sh"
+grep -n ' / ' "$M/etc/fstab"
+grep -nE 'sr0|iso9660' "$M/etc/fstab" && echo "WARNING: fstab mentions sr0/iso9660" || echo FSTAB_OK
+test -f "$M/boot/map" && echo LILO_MAP_OK
+
+umount -R "$M"; losetup -d "$L"; trap - EXIT
+
+echo "=== 6. SWAP (renames only)"
+mv "$CUR" "$CUR.prev"
+mv "$NEW" "$CUR"
+ls -lh "$CUR" "$CUR.prev"
+echo IMAGE_READY
+SCRIPT
+bash -n /data/lilo-rebuild-img.sh && echo SYNTAX_OK
+tmux kill-session -t qnet-iso 2>/dev/null; pgrep -af qemu-system
+bash /data/lilo-rebuild-img.sh 2>&1 | tee /data/sda4/lilo-rebuild-img.log
